@@ -4,12 +4,13 @@ import type { Pool } from 'mysql2/promise';
 import type { BotConfig } from '../../types/index.js';
 import { findActiveWeatherMarkets } from '../market-matcher/index.js';
 import { getMarketData } from '../market-matcher/grimoire.js';
-import { fetchEnsemble } from '../weather-data/index.js';
+import { fetchRawEnsemble, extractDailyHighLow, type EnsembleMember } from '../weather-data/index.js';
+import type { EnsembleForecast } from '../../types/index.js';
 import { analyzeBracket } from '../probability-engine/index.js';
 import { evaluateBet, type RiskContext } from '../risk-manager/index.js';
 import { executeBet, checkOrderFills, cancelStaleOrders } from '../order-executor/index.js';
 import { getOpenBetsCount, getTotalOpenExposure, getDailyPnl, getHourlyPnl, getMonthlyPnl, getBetsForResolution, updateBetStatus } from '../../db/queries.js';
-import { notify, isBotPaused, setPaused } from '../telegram-bot/index.js';
+import { notify, isBotPaused, setPaused, setPausedUntil } from '../telegram-bot/index.js';
 
 let isRunning = false;
 
@@ -50,23 +51,52 @@ async function runPipeline(pool: Pool, config: BotConfig): Promise<void> {
       monthlyPnl: await getMonthlyPnl(pool),
     };
 
-    const forecastCache = new Map<string, Awaited<ReturnType<typeof fetchEnsemble>>>();
+    interface CachedRawEnsemble {
+      times: string[];
+      members: EnsembleMember[];
+      modelRun: string;
+    }
+    const rawEnsembleCache = new Map<string, CachedRawEnsemble>();
 
     let betsPlaced = 0;
 
     for (const market of markets) {
-      const cacheKey = `${market.city.lat}_${market.city.lon}_${market.resolutionDate}`;
+      const cacheKey = `${market.city.lat}_${market.city.lon}`;
 
-      let forecast = forecastCache.get(cacheKey);
-      if (!forecast) {
+      let cached = rawEnsembleCache.get(cacheKey);
+      if (!cached) {
         try {
-          forecast = await fetchEnsemble(market.city, market.resolutionDate);
-          forecastCache.set(cacheKey, forecast);
+          cached = await fetchRawEnsemble(market.city);
+          rawEnsembleCache.set(cacheKey, cached);
         } catch (err) {
           console.error(`[scheduler] Forecast failed for ${market.city.key}:`, err);
           await notify(`Forecast fetch failed for ${market.city.key}: ${err}`, 'WARN');
           continue;
         }
+      }
+
+      let forecast: EnsembleForecast;
+      try {
+        const { dailyHighs, dailyLows, validCount } = extractDailyHighLow(
+          cached.times,
+          cached.members,
+          market.resolutionDate
+        );
+        if (validCount < 25) {
+          throw new Error(`Only ${validCount} valid members for ${market.city.key} on ${market.resolutionDate} (need >= 25)`);
+        }
+        forecast = {
+          city: market.city,
+          forecastDate: market.resolutionDate,
+          modelRun: cached.modelRun,
+          memberCount: validCount,
+          dailyHighs,
+          dailyLows,
+        };
+      } catch (err) {
+        console.error(`[scheduler] Forecast processing failed for ${market.city.key} on ${market.resolutionDate}:`, err);
+        await notify(`Forecast processing failed for ${market.city.key} (${market.resolutionDate}): ${err}`, 'WARN');
+        continue;
       }
 
       const analysis = analyzeBracket(forecast, market, config.estimatedFees);
@@ -79,14 +109,19 @@ async function runPipeline(pool: Pool, config: BotConfig): Promise<void> {
         console.log(`[scheduler] Skipping: ${decision.reason}`);
         const reason = decision.reason ?? '';
         if (reason.includes('monthly loss limit')) {
-          await notify(`Monthly loss limit hit — bot paused for the month. Reason: ${reason}`, 'CRITICAL');
-          setPaused(true);
+          const now = new Date();
+          const firstOfNextMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
+          await notify(`Monthly loss limit hit — bot paused until ${firstOfNextMonth.toISOString()}. Reason: ${reason}`, 'CRITICAL');
+          setPausedUntil(firstOfNextMonth);
         } else if (reason.includes('daily loss limit')) {
-          await notify(`Daily loss limit hit — bot paused. Reason: ${reason}`, 'WARN');
-          setPaused(true);
+          const now = new Date();
+          const nextMidnightUtc = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+          await notify(`Daily loss limit hit — bot paused until ${nextMidnightUtc.toISOString()}. Reason: ${reason}`, 'WARN');
+          setPausedUntil(nextMidnightUtc);
         } else if (reason.includes('1-hour rolling loss')) {
-          await notify(`Hourly loss limit hit — bot pausing for 4 hours. Reason: ${reason}`, 'WARN');
-          setPaused(true);
+          const resumeAt = new Date(Date.now() + 4 * 60 * 60 * 1000);
+          await notify(`Hourly loss limit hit — bot pausing for 4 hours until ${resumeAt.toISOString()}. Reason: ${reason}`, 'WARN');
+          setPausedUntil(resumeAt);
         }
         continue;
       }

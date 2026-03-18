@@ -9,6 +9,7 @@ type NotifyLevel = 'INFO' | 'WARN' | 'CRITICAL';
 let bot: TelegramBot | null = null;
 let chatId: string = '';
 let isPaused = false;
+let pausedUntil: Date | null = null;
 
 export function initTelegram(config: BotConfig): void {
   if (!config.telegram.botToken || !config.telegram.chatId) {
@@ -37,12 +38,14 @@ export function initTelegram(config: BotConfig): void {
   bot.onText(/\/pause/, async (msg) => {
     if (String(msg.chat.id) !== chatId) return;
     isPaused = true;
+    pausedUntil = null;
     await bot!.sendMessage(msg.chat.id, 'Bot paused. Existing bets ride to resolution.');
   });
 
   bot.onText(/\/resume/, async (msg) => {
     if (String(msg.chat.id) !== chatId) return;
     isPaused = false;
+    pausedUntil = null;
     await bot!.sendMessage(msg.chat.id, 'Bot resumed.');
   });
 
@@ -63,11 +66,30 @@ export function setTelegramContext(pool: Pool, config: BotConfig): void {
 }
 
 export function isBotPaused(): boolean {
+  if (isPaused && pausedUntil) {
+    if (new Date() >= pausedUntil) {
+      // Auto-resume after expiry
+      isPaused = false;
+      pausedUntil = null;
+      console.log('[telegram] Auto-resumed after pause expiry');
+      return false;
+    }
+  }
   return isPaused;
 }
 
 export function setPaused(value: boolean): void {
-  isPaused = value;
+  if (!value) {
+    pausedUntil = null;
+    isPaused = false;
+  } else {
+    isPaused = true;
+  }
+}
+
+export function setPausedUntil(until: Date): void {
+  isPaused = true;
+  pausedUntil = until;
 }
 
 export async function notify(message: string, level: NotifyLevel = 'INFO'): Promise<void> {
@@ -131,8 +153,10 @@ async function handlePnl(chat: number): Promise<void> {
 async function handleStatus(chat: number): Promise<void> {
   if (!configRef) return;
 
+  const paused = isBotPaused();
+  const pauseInfo = paused && pausedUntil ? ` (until ${pausedUntil.toISOString()})` : '';
   await bot!.sendMessage(chat,
-    `Status: ${isPaused ? 'PAUSED' : 'RUNNING'}\nPhase: ${configRef.phase}\nCapital: $${configRef.capital}\nMax bet: $${configRef.maxBet}`
+    `Status: ${paused ? `PAUSED${pauseInfo}` : 'RUNNING'}\nPhase: ${configRef.phase}\nCapital: $${configRef.capital}\nMax bet: $${configRef.maxBet}`
   );
 }
 

@@ -72,6 +72,44 @@ export function extractDailyHighLow(
 }
 
 /**
+ * Fetch raw GFS ensemble data from Open-Meteo for a given city.
+ * Returns parsed members and raw time array without extracting per-date highs/lows.
+ * Retries up to 3 times with exponential backoff.
+ */
+export async function fetchRawEnsemble(city: CityConfig): Promise<{
+  times: string[];
+  members: EnsembleMember[];
+  modelRun: string;
+}> {
+  const url = `${ENSEMBLE_API}?latitude=${city.lat}&longitude=${city.lon}&hourly=temperature_2m&models=gfs_seamless&forecast_days=3&timezone=${encodeURIComponent(city.timezone)}`;
+
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      const response = await axios.get(url, { timeout: TIMEOUT_MS });
+      const data = response.data;
+
+      const members = parseEnsembleResponse(data);
+
+      return {
+        times: data.hourly.time as string[],
+        members,
+        modelRun: data.current?.time || new Date().toISOString(),
+      };
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      if (attempt < MAX_RETRIES - 1) {
+        const delayMs = Math.pow(2, attempt) * 1000;
+        await new Promise(r => setTimeout(r, delayMs));
+      }
+    }
+  }
+
+  throw new Error(`[weather-data] Failed to fetch raw ensemble for ${city.key} after ${MAX_RETRIES} retries: ${lastError?.message}`);
+}
+
+/**
  * Fetch GFS ensemble forecast from Open-Meteo for a given city.
  * Returns an EnsembleForecast with daily highs/lows per member.
  * Retries up to 3 times with exponential backoff.

@@ -29,6 +29,10 @@ export async function executeBet(
   const limitPrice = currentAsk;
   const betSize = Math.min(decision.betSize, parseFloat(book.asks[0]?.size || '9999'));
 
+  if (betSize < config.minBet) {
+    return { success: false, error: `Available liquidity $${betSize.toFixed(2)} below min bet $${config.minBet}` };
+  }
+
   const betFields = {
     market_id: market.marketId,
     token_id: market.tokenId,
@@ -69,7 +73,7 @@ export async function executeBet(
     console.error(`[order-executor] Order failed #${betId}: ${result.rawOutput}`);
   }
 
-  return result;
+  return { success: result.success, orderId: result.orderId, rawCliOutput: result.rawOutput };
 }
 
 export async function checkOrderFills(pool: Pool): Promise<void> {

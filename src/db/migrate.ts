@@ -10,6 +10,12 @@ export async function runMigrations(pool: Pool): Promise<void> {
     join(__dirname, 'migrations', '001_create_weather_bets.sql'),
     'utf-8'
   );
-  await pool.execute(sql);
+  const statements = sql
+    .split(';')
+    .map(s => s.trim())
+    .filter(s => s.length > 0);
+  for (const statement of statements) {
+    await pool.execute(statement);
+  }
   console.log('[db] Migrations complete');
 }
