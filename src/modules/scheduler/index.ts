@@ -2,6 +2,7 @@
 import cron from 'node-cron';
 import type { Pool } from 'mysql2/promise';
 import type { BotConfig } from '../../types/index.js';
+import { log, warn, error } from '../../logger.js';
 import { findActiveWeatherMarkets } from '../market-matcher/index.js';
 import { getMarketData } from '../market-matcher/grimoire.js';
 import { fetchRawEnsemble, extractDailyHighLow, type EnsembleMember } from '../weather-data/index.js';
@@ -16,23 +17,23 @@ let isRunning = false;
 
 async function runPipeline(pool: Pool, config: BotConfig): Promise<void> {
   if (isRunning) {
-    console.log('[scheduler] Pipeline already running, skipping');
+    log('[scheduler] Pipeline already running, skipping');
     return;
   }
   if (isBotPaused()) {
-    console.log('[scheduler] Bot is paused, skipping pipeline');
+    log('[scheduler] Bot is paused, skipping pipeline');
     return;
   }
 
   isRunning = true;
-  console.log(`[scheduler] Pipeline started at ${new Date().toISOString()}`);
+  log(`[scheduler] Pipeline started at ${new Date().toISOString()}`);
 
   try {
     let markets: Awaited<ReturnType<typeof findActiveWeatherMarkets>>;
     try {
       markets = await findActiveWeatherMarkets();
     } catch (err) {
-      console.error('[scheduler] Grimoire CLI failure — market discovery unavailable:', err);
+      error(`[scheduler] Grimoire CLI failure — market discovery unavailable: ${err}`);
       await notify(`Grimoire CLI failure — market discovery unavailable: ${err}`, 'CRITICAL');
       return;
     }
@@ -69,7 +70,7 @@ async function runPipeline(pool: Pool, config: BotConfig): Promise<void> {
           cached = await fetchRawEnsemble(market.city);
           rawEnsembleCache.set(cacheKey, cached);
         } catch (err) {
-          console.error(`[scheduler] Forecast failed for ${market.city.key}:`, err);
+          error(`[scheduler] Forecast failed for ${market.city.key}: ${err}`);
           await notify(`Forecast fetch failed for ${market.city.key}: ${err}`, 'WARN');
           continue;
         }
@@ -94,7 +95,7 @@ async function runPipeline(pool: Pool, config: BotConfig): Promise<void> {
           dailyLows,
         };
       } catch (err) {
-        console.error(`[scheduler] Forecast processing failed for ${market.city.key} on ${market.resolutionDate}:`, err);
+        error(`[scheduler] Forecast processing failed for ${market.city.key} on ${market.resolutionDate}: ${err}`);
         await notify(`Forecast processing failed for ${market.city.key} (${market.resolutionDate}): ${err}`, 'WARN');
         continue;
       }
@@ -106,22 +107,26 @@ async function runPipeline(pool: Pool, config: BotConfig): Promise<void> {
 
       const decision = evaluateBet(analysis, config, riskCtx);
       if (!decision.approved) {
-        console.log(`[scheduler] Skipping: ${decision.reason}`);
         const reason = decision.reason ?? '';
         if (reason.includes('monthly loss limit')) {
           const now = new Date();
           const firstOfNextMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
+          warn(`[scheduler] Monthly loss limit hit — pausing until ${firstOfNextMonth.toISOString()}. Reason: ${reason}`);
           await notify(`Monthly loss limit hit — bot paused until ${firstOfNextMonth.toISOString()}. Reason: ${reason}`, 'CRITICAL');
           setPausedUntil(firstOfNextMonth);
         } else if (reason.includes('daily loss limit')) {
           const now = new Date();
           const nextMidnightUtc = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+          warn(`[scheduler] Daily loss limit hit — pausing until ${nextMidnightUtc.toISOString()}. Reason: ${reason}`);
           await notify(`Daily loss limit hit — bot paused until ${nextMidnightUtc.toISOString()}. Reason: ${reason}`, 'WARN');
           setPausedUntil(nextMidnightUtc);
         } else if (reason.includes('1-hour rolling loss')) {
           const resumeAt = new Date(Date.now() + 4 * 60 * 60 * 1000);
+          warn(`[scheduler] Hourly loss limit hit — pausing for 4h until ${resumeAt.toISOString()}. Reason: ${reason}`);
           await notify(`Hourly loss limit hit — bot pausing for 4 hours until ${resumeAt.toISOString()}. Reason: ${reason}`, 'WARN');
           setPausedUntil(resumeAt);
+        } else {
+          console.log(`[scheduler] Skipping: ${reason}`);
         }
         continue;
       }
@@ -140,9 +145,9 @@ async function runPipeline(pool: Pool, config: BotConfig): Promise<void> {
       }
     }
 
-    console.log(`[scheduler] Pipeline complete. ${betsPlaced} bets placed.`);
+    log(`[scheduler] Pipeline complete. ${betsPlaced} bets placed.`);
   } catch (err) {
-    console.error('[scheduler] Pipeline error:', err);
+    error(`[scheduler] Pipeline error: ${err}`);
     await notify(`Pipeline error: ${err}`, 'WARN');
   } finally {
     isRunning = false;
@@ -193,7 +198,8 @@ async function checkResolutions(pool: Pool, config: BotConfig): Promise<void> {
 }
 
 export function startScheduler(pool: Pool, config: BotConfig): void {
-  cron.schedule('17 */2 * * *', () => {
+  const interval = config.scanIntervalMinutes;
+  cron.schedule(`*/${interval} * * * *`, () => {
     runPipeline(pool, config);
   });
 
@@ -209,28 +215,21 @@ export function startScheduler(pool: Pool, config: BotConfig): void {
     cancelStaleOrders(pool);
   });
 
-  console.log('[scheduler] All cron jobs scheduled');
-  console.log('[scheduler] Pipeline: every 2h at :17');
-  console.log('[scheduler] Fill checks: every 30m');
-  console.log('[scheduler] Resolution checks: every 1h');
-  console.log('[scheduler] Stale order cleanup: every 1h at :05');
+  log(`[scheduler] All cron jobs scheduled`);
+  log(`[scheduler] Pipeline: every ${interval}m`);
+  log('[scheduler] Fill checks: every 30m');
+  log('[scheduler] Resolution checks: every 1h');
+  log('[scheduler] Stale order cleanup: every 1h at :05');
 
+  // Run startup pipeline unless next scheduled run is very soon
   const now = new Date();
-  const currentHour = now.getHours();
   const currentMin = now.getMinutes();
-  const nextEvenHour = currentHour % 2 === 0
-    ? (currentMin < 17 ? currentHour : currentHour + 2)
-    : currentHour + 1;
+  const minutesUntilNext = interval - (currentMin % interval);
 
-  const nextFire = new Date(now);
-  nextFire.setHours(nextEvenHour % 24, 17, 0, 0);
-  if (nextFire <= now) nextFire.setHours(nextFire.getHours() + 2);
-  const minutesUntilNext = Math.round((nextFire.getTime() - now.getTime()) / 60_000);
-
-  if (minutesUntilNext > 10) {
-    console.log(`[scheduler] Running startup pipeline (next cron in ${minutesUntilNext}m)`);
+  if (minutesUntilNext > Math.min(5, interval / 3)) {
+    log(`[scheduler] Running startup pipeline (next cron in ${minutesUntilNext}m)`);
     runPipeline(pool, config);
   } else {
-    console.log(`[scheduler] Next cycle in ${minutesUntilNext}m — skipping startup run`);
+    log(`[scheduler] Next cycle in ${minutesUntilNext}m — skipping startup run`);
   }
 }

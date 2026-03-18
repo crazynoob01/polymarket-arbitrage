@@ -3,6 +3,7 @@ import type { Pool } from 'mysql2/promise';
 import type { BetDecision, MatchedMarket, BracketAnalysis, OrderResult, BotConfig } from '../../types/index.js';
 import { getOrderBook, getBestAsk, placeLimitOrder, getOrderStatus, cancelOrder } from '../market-matcher/grimoire.js';
 import { insertBet, updateBetStatus, getBetsByStatus, getStaleOrders } from '../../db/queries.js';
+import { log, error } from '../../logger.js';
 
 export async function executeBet(
   decision: BetDecision,
@@ -55,7 +56,7 @@ export async function executeBet(
 
   if (config.phase === '2a') {
     const betId = await insertBet(pool, { ...betFields, status: 'SIMULATED' });
-    console.log(`[order-executor] SIMULATED bet #${betId}: ${market.marketTitle} @ $${limitPrice} for $${betSize}`);
+    log(`[order-executor] SIMULATED bet #${betId}: ${market.marketTitle} @ $${limitPrice} for $${betSize}`);
     return { success: true, orderId: `SIM-${betId}` };
   }
 
@@ -68,9 +69,9 @@ export async function executeBet(
   });
 
   if (result.success) {
-    console.log(`[order-executor] Order placed #${betId}: ${market.marketTitle} @ $${limitPrice} for $${betSize}`);
+    log(`[order-executor] Order placed #${betId}: ${market.marketTitle} @ $${limitPrice} for $${betSize}`);
   } else {
-    console.error(`[order-executor] Order failed #${betId}: ${result.rawOutput}`);
+    error(`[order-executor] Order failed #${betId}: ${result.rawOutput}`);
   }
 
   return { success: result.success, orderId: result.orderId, rawCliOutput: result.rawOutput };

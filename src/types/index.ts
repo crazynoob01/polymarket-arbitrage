@@ -108,6 +108,7 @@ export interface BotConfig {
   dailyLossLimit: number;
   hourlyLossLimit: number;
   monthlyLossLimit: number;
+  scanIntervalMinutes: number;
   mysql: {
     host: string;
     database: string;

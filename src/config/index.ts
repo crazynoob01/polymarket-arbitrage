@@ -25,6 +25,7 @@ export function loadConfig(): BotConfig {
     dailyLossLimit: 0.03,
     hourlyLossLimit: 0.02,
     monthlyLossLimit: 0.20,
+    scanIntervalMinutes: Number(process.env.SCAN_INTERVAL_MINUTES || 15),
     mysql: {
       host: process.env.MYSQL_HOST || 'localhost',
       database: process.env.MYSQL_DATABASE || 'polymarket_arb',
