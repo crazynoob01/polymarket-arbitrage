@@ -76,6 +76,8 @@ export interface BetRecord {
   market_title: string;
   bracket_lower: number;
   bracket_upper: number;
+  bracket_lower_c: number;
+  bracket_upper_c: number;
   unit: 'F' | 'C';
   forecast_prob: number;
   market_price: number;
