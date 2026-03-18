@@ -27,7 +27,13 @@ function calcForecastHorizonDays(resolutionDate: string): number {
 }
 
 export async function findActiveWeatherMarkets(): Promise<MatchedMarket[]> {
-  const rawMarkets = await searchMarkets('temperature');
+  let rawMarkets: Awaited<ReturnType<typeof searchMarkets>>;
+  try {
+    rawMarkets = await searchMarkets('temperature');
+  } catch (err) {
+    console.error('[market-matcher] Grimoire CLI failure — cannot fetch markets:', err);
+    throw err;
+  }
   const matched: MatchedMarket[] = [];
 
   for (const raw of rawMarkets) {

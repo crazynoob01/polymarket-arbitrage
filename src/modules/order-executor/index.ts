@@ -89,7 +89,7 @@ export async function checkOrderFills(pool: Pool): Promise<void> {
       await updateBetStatus(pool, bet.id, 'FILLED', { fill_amount: filledSize || Number(bet.bet_size) });
       console.log(`[order-executor] Order ${bet.order_id} FILLED`);
     } else if (filledSize > 0 && filledSize < bet.bet_size) {
-      await updateBetStatus(pool, bet.id, 'FILLED', { fill_amount: filledSize });
+      await updateBetStatus(pool, bet.id, 'PARTIALLY_FILLED', { fill_amount: filledSize });
       await cancelOrder(bet.order_id);
       console.log(`[order-executor] Order ${bet.order_id} partially filled ($${filledSize}), remainder cancelled`);
     }

@@ -13,6 +13,7 @@ export function getPool(config: BotConfig['mysql']): mysql.Pool {
       waitForConnections: true,
       connectionLimit: 5,
       queueLimit: 0,
+      multipleStatements: true,
     });
   }
   return pool;

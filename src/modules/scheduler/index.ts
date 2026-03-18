@@ -9,7 +9,7 @@ import { analyzeBracket } from '../probability-engine/index.js';
 import { evaluateBet, type RiskContext } from '../risk-manager/index.js';
 import { executeBet, checkOrderFills, cancelStaleOrders } from '../order-executor/index.js';
 import { getOpenBetsCount, getTotalOpenExposure, getDailyPnl, getHourlyPnl, getMonthlyPnl, getBetsForResolution, updateBetStatus } from '../../db/queries.js';
-import { notify, isBotPaused } from '../telegram-bot/index.js';
+import { notify, isBotPaused, setPaused } from '../telegram-bot/index.js';
 
 let isRunning = false;
 
@@ -27,9 +27,18 @@ async function runPipeline(pool: Pool, config: BotConfig): Promise<void> {
   console.log(`[scheduler] Pipeline started at ${new Date().toISOString()}`);
 
   try {
-    const markets = await findActiveWeatherMarkets();
+    let markets: Awaited<ReturnType<typeof findActiveWeatherMarkets>>;
+    try {
+      markets = await findActiveWeatherMarkets();
+    } catch (err) {
+      console.error('[scheduler] Grimoire CLI failure — market discovery unavailable:', err);
+      await notify(`Grimoire CLI failure — market discovery unavailable: ${err}`, 'CRITICAL');
+      return;
+    }
+
     if (markets.length === 0) {
       console.log('[scheduler] No tradeable markets found');
+      await notify('No tradeable weather markets found — check Grimoire connectivity or market availability', 'WARN');
       return;
     }
 
@@ -46,7 +55,7 @@ async function runPipeline(pool: Pool, config: BotConfig): Promise<void> {
     let betsPlaced = 0;
 
     for (const market of markets) {
-      const cacheKey = `${market.city.lat}_${market.city.lon}`;
+      const cacheKey = `${market.city.lat}_${market.city.lon}_${market.resolutionDate}`;
 
       let forecast = forecastCache.get(cacheKey);
       if (!forecast) {
@@ -68,6 +77,17 @@ async function runPipeline(pool: Pool, config: BotConfig): Promise<void> {
       const decision = evaluateBet(analysis, config, riskCtx);
       if (!decision.approved) {
         console.log(`[scheduler] Skipping: ${decision.reason}`);
+        const reason = decision.reason ?? '';
+        if (reason.includes('monthly loss limit')) {
+          await notify(`Monthly loss limit hit — bot paused for the month. Reason: ${reason}`, 'CRITICAL');
+          setPaused(true);
+        } else if (reason.includes('daily loss limit')) {
+          await notify(`Daily loss limit hit — bot paused. Reason: ${reason}`, 'WARN');
+          setPaused(true);
+        } else if (reason.includes('1-hour rolling loss')) {
+          await notify(`Hourly loss limit hit — bot pausing for 4 hours. Reason: ${reason}`, 'WARN');
+          setPaused(true);
+        }
         continue;
       }
 

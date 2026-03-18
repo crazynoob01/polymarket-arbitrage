@@ -18,20 +18,15 @@ export interface GrimoireMarketResult {
 }
 
 export async function searchMarkets(query: string): Promise<GrimoireMarketResult[]> {
-  try {
-    const { stdout } = await execFileAsync(GRIMOIRE_CMD, [
-      'venue', 'polymarket', 'search-markets',
-      '--query', query,
-      '--active-only', 'true',
-      '--open-only', 'true',
-      '--format', 'json',
-    ], { timeout: 30_000 });
+  const { stdout } = await execFileAsync(GRIMOIRE_CMD, [
+    'venue', 'polymarket', 'search-markets',
+    '--query', query,
+    '--active-only', 'true',
+    '--open-only', 'true',
+    '--format', 'json',
+  ], { timeout: 30_000 });
 
-    return JSON.parse(stdout);
-  } catch (err) {
-    console.error('[grimoire] search-markets failed:', err);
-    return [];
-  }
+  return JSON.parse(stdout);
 }
 
 export interface OrderBookEntry {

@@ -66,6 +66,10 @@ export function isBotPaused(): boolean {
   return isPaused;
 }
 
+export function setPaused(value: boolean): void {
+  isPaused = value;
+}
+
 export async function notify(message: string, level: NotifyLevel = 'INFO'): Promise<void> {
   const prefix = level === 'CRITICAL' ? '🚨 ' : level === 'WARN' ? '⚠️ ' : 'ℹ️ ';
   const text = `${prefix}${message}`;
