@@ -1,0 +1,6 @@
+.env
+.idea
+scripts
+node_modules/
+dist/
+*.log
