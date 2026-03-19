@@ -5,7 +5,7 @@ import type { BotConfig } from '../../types/index.js';
 import { log, warn, error } from '../../logger.js';
 import { findActiveWeatherMarkets } from '../market-matcher/index.js';
 import { getMarketData } from '../market-matcher/grimoire.js';
-import { fetchRawEnsemble, extractDailyHighLow, type EnsembleMember } from '../weather-data/index.js';
+import { fetchMultiModelEnsemble, extractDailyHighLow, type EnsembleMember } from '../weather-data/index.js';
 import type { EnsembleForecast } from '../../types/index.js';
 import { analyzeBracket } from '../probability-engine/index.js';
 import { evaluateBet, type RiskContext } from '../risk-manager/index.js';
@@ -56,6 +56,7 @@ async function runPipeline(pool: Pool, config: BotConfig): Promise<void> {
       times: string[];
       members: EnsembleMember[];
       modelRun: string;
+      sources: Array<{ model: string; memberCount: number }>;
     }
     const rawEnsembleCache = new Map<string, CachedRawEnsemble>();
 
@@ -67,7 +68,7 @@ async function runPipeline(pool: Pool, config: BotConfig): Promise<void> {
       let cached = rawEnsembleCache.get(cacheKey);
       if (!cached) {
         try {
-          cached = await fetchRawEnsemble(market.city);
+          cached = await fetchMultiModelEnsemble(market.city, config.ensembleModels);
           rawEnsembleCache.set(cacheKey, cached);
         } catch (err) {
           error(`[scheduler] Forecast failed for ${market.city.key}: ${err}`);
@@ -93,6 +94,7 @@ async function runPipeline(pool: Pool, config: BotConfig): Promise<void> {
           memberCount: validCount,
           dailyHighs,
           dailyLows,
+          modelSources: cached.sources,
         };
       } catch (err) {
         error(`[scheduler] Forecast processing failed for ${market.city.key} on ${market.resolutionDate}: ${err}`);

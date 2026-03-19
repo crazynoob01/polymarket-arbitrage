@@ -33,6 +33,7 @@ export interface EnsembleForecast {
   memberCount: number;
   dailyHighs: number[];
   dailyLows: number[];
+  modelSources?: { model: string; memberCount: number }[];
 }
 
 /** Output of ProbabilityEngine — analysis for one market */
@@ -109,6 +110,7 @@ export interface BotConfig {
   hourlyLossLimit: number;
   monthlyLossLimit: number;
   scanIntervalMinutes: number;
+  ensembleModels: string[];
   mysql: {
     host: string;
     database: string;

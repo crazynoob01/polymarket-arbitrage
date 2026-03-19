@@ -26,6 +26,10 @@ export function loadConfig(): BotConfig {
     hourlyLossLimit: 0.02,
     monthlyLossLimit: 0.20,
     scanIntervalMinutes: Number(process.env.SCAN_INTERVAL_MINUTES || 15),
+    ensembleModels: (process.env.ENSEMBLE_MODELS || 'gfs_seamless,ecmwf_ifs025')
+      .split(',')
+      .map(m => m.trim())
+      .filter(Boolean),
     mysql: {
       host: process.env.MYSQL_HOST || 'localhost',
       database: process.env.MYSQL_DATABASE || 'polymarket_arb',

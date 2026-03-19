@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { parseEnsembleResponse, extractDailyHighLow } from '../../src/modules/weather-data/index.js';
+import { parseEnsembleResponse, extractDailyHighLow, mergeEnsembleMembers } from '../../src/modules/weather-data/index.js';
+import type { EnsembleMember } from '../../src/modules/weather-data/index.js';
 import type { CityConfig } from '../../src/types/index.js';
 
 const NYC: CityConfig = {
@@ -36,6 +37,12 @@ describe('WeatherData', () => {
       expect(members.length).toBe(30);
     });
 
+    it('extracts 50 members when available (ECMWF)', () => {
+      const response = makeMockResponse('2026-03-20', 50);
+      const members = parseEnsembleResponse(response);
+      expect(members.length).toBe(50);
+    });
+
     it('throws if fewer than 25 valid members', () => {
       const response = makeMockResponse('2026-03-20', 20);
       expect(() => parseEnsembleResponse(response)).toThrow();
@@ -55,6 +62,15 @@ describe('WeatherData', () => {
       }
     });
 
+    it('handles 80 members from multi-model ensemble', () => {
+      const response = makeMockResponse('2026-03-20', 80);
+      const members = parseEnsembleResponse(response);
+      const result = extractDailyHighLow(response.hourly.time as string[], members, '2026-03-20');
+
+      expect(result.dailyHighs).toHaveLength(80);
+      expect(result.dailyLows).toHaveLength(80);
+    });
+
     it('rejects members with NaN values', () => {
       const response = makeMockResponse('2026-03-20');
       const key = 'temperature_2m_member01';
@@ -65,6 +81,46 @@ describe('WeatherData', () => {
 
       expect(result.dailyHighs).toHaveLength(29);
       expect(result.dailyLows).toHaveLength(29);
+    });
+  });
+
+  describe('mergeEnsembleMembers', () => {
+    it('concatenates members from multiple model results', () => {
+      const gfsMembers: EnsembleMember[] = [
+        { key: 'temperature_2m_member01', values: [10, 11, 12] },
+        { key: 'temperature_2m_member02', values: [13, 14, 15] },
+      ];
+      const ecmwfMembers: EnsembleMember[] = [
+        { key: 'temperature_2m_member01', values: [11, 12, 13] },
+        { key: 'temperature_2m_member02', values: [14, 15, 16] },
+        { key: 'temperature_2m_member03', values: [12, 13, 14] },
+      ];
+
+      const merged = mergeEnsembleMembers([
+        { model: 'gfs', members: gfsMembers },
+        { model: 'ecmwf', members: ecmwfMembers },
+      ]);
+
+      expect(merged.members).toHaveLength(5);
+      expect(merged.members[0].key).toBe('gfs_member01');
+      expect(merged.members[2].key).toBe('ecmwf_member01');
+      expect(merged.sources).toEqual([
+        { model: 'gfs', memberCount: 2 },
+        { model: 'ecmwf', memberCount: 3 },
+      ]);
+    });
+
+    it('prefixes member keys with model name to avoid collisions', () => {
+      const a: EnsembleMember[] = [{ key: 'temperature_2m_member01', values: [10] }];
+      const b: EnsembleMember[] = [{ key: 'temperature_2m_member01', values: [11] }];
+
+      const merged = mergeEnsembleMembers([
+        { model: 'gfs', members: a },
+        { model: 'ecmwf', members: b },
+      ]);
+
+      expect(merged.members[0].key).toBe('gfs_member01');
+      expect(merged.members[1].key).toBe('ecmwf_member01');
     });
   });
 });
