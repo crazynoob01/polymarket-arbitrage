@@ -74,3 +74,67 @@ Change: minEdge: 0.12  →  minEdge: 0.08
 | 8% (after fix) | **~12-15** |
 
 **Safety check:** If win rate drops below 50% after 50+ live bets, raise threshold back to 10%.
+
+---
+
+## How to Test
+
+### Step 1: Smoke Test (2 minutes)
+
+Verify multi-model ensemble works with all cities:
+
+```bash
+npx tsx scripts/test-multi-model.ts
+```
+
+**Expected output:** `80 members from gfs(30) + ecmwf(50)` for each city.
+
+### Step 2: Run Paper Trade Bot
+
+```bash
+docker compose up --build
+```
+
+Or locally without Docker:
+
+```bash
+npm run dev
+```
+
+### Step 3: Read the Logs
+
+**Filter results** — shows where markets are being dropped:
+
+```
+[market-matcher] Processing 100 raw markets from search
+[market-matcher] Filter results: {"parse":12,"city":3,"volume":8,"horizon":15,"token":0,"book":5,"ask":2}
+[market-matcher] Found 55 tradeable weather markets
+```
+
+| Filter | Meaning | If High |
+|--------|---------|---------|
+| `parse` | Title didn't match regex | May need new title patterns |
+| `city` | City not in our 14-city list | More cities to add |
+| `volume` | Below $1K | Too thin, expected |
+| `horizon` | More than 3 days out | Expected |
+| `book` | Empty order book | Off-peak hours, try later |
+| `ask` | No valid ask price | Thin market |
+
+**Edge results** — shows probability and edge for each market that passes filters:
+
+```
+[scheduler] Will the highest temperature in Tokyo be 12°C on March 20?: prob=11.3%, edge=5.2%
+[scheduler] Will the high temperature in NYC on March 20 be between 50-54°F?: prob=28.7%, edge=8.1%
+```
+
+### Step 4: Interpret Results
+
+| What You See | Meaning | Next Action |
+|-------------|---------|-------------|
+| `Found 0 tradeable weather markets` | No markets passing filters | Check filter JSON — which filter is blocking? |
+| Markets found, all edges < 5% | Efficiently priced even with 80 members | Weather may be dead, pivot to other strategies |
+| **Markets found, edges 5-10%** | **Edges exist but below 12% threshold** | **Apply Fix 3 — change `minEdge: 0.12` to `0.08`** |
+| Markets found, some edges > 12% | Bot should place simulated bets | Working as intended |
+| `SIMULATED bet #1: ...` | Paper trade placed | Strategy is working, collect 50+ bets for stats |
+
+**The critical question:** Do edges in the 5-10% range appear? If yes → Fix 3 unlocks them. If no edges at all → market is truly saturated.
