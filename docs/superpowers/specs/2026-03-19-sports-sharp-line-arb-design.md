@@ -8,7 +8,20 @@
 
 ## 1. Overview
 
-A new strategy module that extends the existing polymarket-arbitrage bot. Compares Pinnacle sportsbook odds (via The Odds API) against Polymarket sports market prices. When Pinnacle's vig-removed fair probability exceeds Polymarket's price by more than a configurable edge threshold, the bot places a LIMIT BUY order via Grimoire CLI.
+A new strategy module that extends the existing polymarket-arbitrage bot. Compares Pinnacle sharp bookmaker odds against Polymarket sports market prices. When Pinnacle's vig-removed fair probability exceeds Polymarket's price by more than a configurable edge threshold, the bot places a LIMIT BUY order via Grimoire CLI.
+
+### Data Source Strategy (Phased)
+
+Pinnacle shut down their public API in July 2025. All third-party services now source Pinnacle data via scraping, PS3838 white-label, or commercial intermediaries. The bot uses a phased API approach to balance cost against capital:
+
+| Phase | Data Source | Cost | Latency | Why |
+|-------|-----------|------|---------|-----|
+| **Validate** | SharpAPI free tier | $0/mo | <89ms SSE | 12 req/min (17K/day), 2 sportsbooks, prove concept |
+| **Go Live** | OddsPapi Pro | $49/mo | ~1s WebSocket | 348 books incl. Pinnacle + Polymarket, best value |
+| **Scale ($1.5K+)** | SharpAPI Hobby | $79/mo | <89ms SSE | Fastest latency, TS SDK, use own vig-removal code |
+| **Premium ($3K+)** | SharpAPI Pro | $229/mo | <89ms SSE | Pre-computed EV, arb detection, middles alerts |
+
+**Fallback strategy:** If Pinnacle data disappears from any provider, use **consensus devigging** — median of Shin-devigged probabilities across 40+ bookmakers approximates sharp lines well enough for our 5%+ edge threshold.
 
 ### Why This Works
 
@@ -39,9 +52,9 @@ Pinnacle is the sharpest sportsbook in the world — it accepts unlimited bets f
 ```
 src/modules/
   sports/
-    odds-client/          # The Odds API client — fetches Pinnacle + Polymarket odds
+    odds-client/          # Abstracted odds client — supports SharpAPI, OddsPapi, or consensus
     vig-removal/          # Converts raw bookmaker odds to fair probabilities (Shin method)
-    sports-matcher/       # Matches The Odds API events to Polymarket condition IDs for execution
+    sports-matcher/       # Matches odds provider events to Polymarket condition IDs for execution
     sports-pipeline/      # Orchestrates: fetch odds -> compare -> risk check -> execute
 ```
 
@@ -125,36 +138,39 @@ SELECT COALESCE(SUM(pnl), 0) FROM (
 ### 2.4 Pipeline Flow
 
 ```
-Every 15 minutes during active game hours:
+On each update (SSE push, WebSocket delta, or 15-min poll):
 
-1. FETCH ODDS
-   The Odds API: GET /v4/sports/{sport}/odds?bookmakers=pinnacle,polymarket
-   → Returns both Pinnacle odds AND Polymarket prices for every game, pre-matched
-   → One call per sport per market type
-   → Cost: 1 credit per (market_type x region)
+1. FETCH ODDS (via pluggable OddsClient adapter)
+   SharpAPI SSE / OddsPapi WebSocket / Consensus poll
+   → Returns sharp odds (Pinnacle or consensus) per game
+   → May also return Polymarket prices (OddsPapi does)
 
-2. VIG REMOVAL
-   For each game where Pinnacle has odds:
-   → Convert Pinnacle decimal odds to implied probabilities
+2. FETCH POLYMARKET PRICES (if not included in odds source)
+   → Polymarket Gamma API or Grimoire CLI
+   → Get current Yes/No token prices for matching games
+
+3. VIG REMOVAL (skip if using SharpAPI Pro with pre-computed EV)
+   For each game where sharp odds exist:
+   → Convert decimal odds to implied probabilities
    → Remove vig using Shin method → fair probabilities
    → For 2-way (NBA/NFL): closed-form solution
    → For 3-way (soccer): iterative Shin solver
 
-3. EDGE DETECTION
-   For each game where both Pinnacle and Polymarket have prices:
-   → edge = pinnacle_fair_prob - polymarket_price - estimated_fees
+4. EDGE DETECTION
+   For each game where both sharp prob and Polymarket price exist:
+   → edge = fair_prob - polymarket_price - estimated_fees
    → If edge > min_edge (default 5%): signal
 
-4. RISK CHECK (reuse existing evaluateBet)
+5. RISK CHECK (reuse existing evaluateRisk)
    → Kelly sizing with 0.15x fractional Kelly
    → Check concurrent bets, daily/hourly/monthly loss limits
    → Cap at maxBet
 
-5. MARKET RESOLUTION (match to Polymarket token for execution)
+6. MARKET RESOLUTION (match to Polymarket token for execution)
    → Look up Polymarket condition_id and token_id for the matching game outcome
    → Verify orderbook has sufficient liquidity at or near the target price
 
-6. EXECUTE (reuse existing executeBet flow)
+7. EXECUTE (reuse existing order execution flow)
    → Fetch current orderbook via Grimoire
    → Re-verify edge at current best ask
    → Place LIMIT BUY via Grimoire CLI
@@ -164,19 +180,22 @@ Every 15 minutes during active game hours:
 ### 2.5 Data Flow Diagram
 
 ```
-The Odds API
-  ├── Pinnacle odds ──→ VigRemoval (Shin) ──→ fair_probability
-  └── Polymarket odds ──→ polymarket_price
+OddsClient (SharpAPI / OddsPapi / Consensus)
+  ├── Sharp odds ──→ VigRemoval (Shin) ──→ fair_probability
+  │                  (skip if SharpAPI Pro provides ev_percent)
+  │
+Polymarket (Gamma API / Grimoire / OddsPapi)
+  └── polymarket_price
                                                     │
                                     edge = fair_prob - poly_price
                                                     │
                                             edge > threshold?
                                                     │ yes
-                                            RiskManager.evaluateBet()
+                                        RiskManager.evaluateRisk()
                                                     │ approved
                                     SportsMatcher.resolvePolymarketToken()
                                                     │
-                                    OrderExecutor.executeBet() via Grimoire
+                                    OrderExecutor.executeOrder() via Grimoire
 ```
 
 ---
@@ -252,30 +271,78 @@ export interface SportsBetRecord {
 
 ### 4.1 Odds Client (`src/modules/sports/odds-client/`)
 
-Thin HTTP client for The Odds API v4.
+Abstracted odds client with pluggable data source backends. The client interface is the same regardless of which API is used — only the adapter changes.
 
 ```typescript
-interface OddsClientConfig {
-  apiKey: string;
-  baseUrl: string;  // https://api.the-odds-api.com/v4
+/** Common interface — all adapters implement this */
+interface OddsClient {
+  fetchOdds(sport: Sport, markets: string[]): Promise<GameOdds[]>;
+  fetchSports(): Promise<SportInfo[]>;
+  getProviderName(): string;
 }
 
-/** Fetch odds for a sport from Pinnacle + Polymarket in one call */
-async function fetchOdds(sport: Sport, markets: string[]): Promise<OddsApiResponse[]>
-
-/** Fetch list of in-season sports (free, 0 credits) */
-async function fetchSports(): Promise<SportInfo[]>
-
-/** Fetch events without odds (free, 0 credits) */
-async function fetchEvents(sport: Sport): Promise<EventInfo[]>
+/** Unified game odds shape returned by all adapters */
+interface GameOdds {
+  eventId: string;
+  sport: Sport;
+  homeTeam: string;
+  awayTeam: string;
+  commenceTime: string;
+  sharpOdds: { name: string; price: number }[];       // Pinnacle or sharp consensus
+  polymarketPrices?: { name: string; price: number }[]; // if provider includes Polymarket
+}
 ```
 
-**Credit usage per call:** `markets.length x 1` (we always use region `eu` for Pinnacle + `us` for Polymarket = 2 regions, so `markets.length x 2`).
+#### Adapter: SharpAPI (Validation Phase — $0/mo)
 
-**Polling strategy:**
-- During active game hours: every 15 minutes
-- Outside game hours: every 60 minutes (just to catch line movements on upcoming games)
-- Game hours vary by sport/timezone — NBA games 7-11 PM ET, EPL games 7:30 AM - 12 PM ET, etc.
+```typescript
+// SSE streaming at sub-89ms latency
+// Free: 12 req/min, 2 sportsbooks
+// Hobby ($79/mo): 20+ sportsbooks, real-time
+// Pro ($229/mo): +EV pre-computed, arb detection
+// SDK: npm install @sharp-api/sdk
+
+class SharpApiAdapter implements OddsClient {
+  // Uses SSE streaming — connect once, receive push updates
+  // When Pro tier: ev_percent field is pre-computed (skip vig removal)
+  // When Hobby/Free: raw odds only, use our vig-removal module
+}
+```
+
+#### Adapter: OddsPapi (Live Phase — $49/mo)
+
+```typescript
+// WebSocket streaming at ~1s latency
+// Free: 250 req/mo (testing only)
+// Pro ($49/mo): WebSocket, all 348 bookmakers
+// Both Pinnacle AND Polymarket in one API
+
+class OddsPapiAdapter implements OddsClient {
+  // WebSocket at wss://api.oddspapi.io/v4/ws?apiKey=...
+  // Delta-only updates (only changed values pushed)
+  // Polymarket share prices ($0-$1) normalized to decimal odds
+}
+```
+
+#### Adapter: Consensus (Fallback — if Pinnacle data disappears)
+
+```typescript
+// Uses any multi-bookmaker API (The Odds API, OddsPapi, etc.)
+// Fetches odds from 40+ bookmakers
+// Shin-devigs each, takes median as "fair" probability
+// Academic research confirms this approximates sharp lines
+
+class ConsensusAdapter implements OddsClient {
+  // No single bookmaker dependency
+  // Accuracy: within 1-2% of Pinnacle for major sports
+  // Sufficient for our 5%+ edge threshold
+}
+```
+
+**Polling/streaming strategy:**
+- SharpAPI: SSE streaming (connect once, receive push updates)
+- OddsPapi: WebSocket streaming (delta updates)
+- Fallback polling: every 15 min during active game hours, every 60 min outside
 
 ### 4.2 Vig Removal (`src/modules/sports/vig-removal/`)
 
@@ -325,34 +392,52 @@ Orchestrates the full cycle. Called by the scheduler.
 
 ```typescript
 async function runSportsPipeline(pool: Pool, config: SportsConfig): Promise<void> {
+  const oddsClient = createOddsClient(config);  // SharpAPI, OddsPapi, or Consensus
+
   // 1. For each configured sport:
   for (const sport of config.sports) {
-    // 2. Fetch odds (Pinnacle + Polymarket) from The Odds API
+    // 2. Fetch odds via pluggable adapter
     const games = await oddsClient.fetchOdds(sport, ['h2h']);
 
-    // 3. For each game with both Pinnacle and Polymarket odds:
+    // 3. For each game with sharp odds:
     for (const game of games) {
-      // 4. Remove vig from Pinnacle odds -> fair probabilities
-      const fairProbs = removeVig(game.pinnacleOdds, 'decimal', 'shin');
+      // 4. Get fair probabilities
+      //    - If SharpAPI Pro: use pre-computed ev_percent (skip vig removal)
+      //    - Otherwise: Shin-devig the sharp odds ourselves
+      const fairProbs = game.evPercent
+        ? game.evPercent  // SharpAPI Pro pre-computed
+        : removeVig(game.sharpOdds, 'decimal', 'shin');
 
-      // 5. Compare fair prob vs Polymarket price
-      for (const outcome of game.outcomes) {
-        const edge = fairProbs[outcome] - game.polymarketPrice[outcome] - config.estimatedFees;
+      // 5. Get Polymarket prices (from same API if OddsPapi, or via Gamma/Grimoire)
+      const polyPrices = game.polymarketPrices
+        ?? await fetchPolymarketPrices(game, sport);
+      if (!polyPrices) continue;
+
+      // 6. Compare fair prob vs Polymarket price
+      for (const outcome of Object.keys(fairProbs)) {
+        const edge = fairProbs[outcome] - polyPrices[outcome] - config.estimatedFees;
         if (edge < config.minEdge) continue;
 
-        // 6. Resolve Polymarket token for this outcome
+        // 7. Resolve Polymarket token for order execution
         const token = await sportsMatcher.resolveToken(game, outcome);
         if (!token) continue;
 
-        // 7. Build analysis object compatible with existing RiskManager
-        const analysis = buildSportsAnalysis(game, outcome, fairProbs, token);
+        // 8. Dedup check — skip if already bet on this game outcome
+        if (await hasPendingBet(pool, game.eventId, outcome)) continue;
 
-        // 8. Risk check (reuse existing evaluateBet)
-        const decision = evaluateBet(analysis, config, riskCtx);
+        // 9. Build strategy-agnostic analysis for risk manager
+        const analysis: StrategyAnalysis = {
+          forecastProbability: fairProbs[outcome],
+          bestAskPrice: polyPrices[outcome],
+          edge,
+        };
+
+        // 10. Risk check (strategy-agnostic evaluateRisk)
+        const decision = evaluateRisk(analysis, config, riskCtx);
         if (!decision.approved) continue;
 
-        // 9. Execute (reuse existing executeBet)
-        await executeBet(decision, token, analysis, config, pool);
+        // 11. Execute via Grimoire
+        await executeSportsOrder(decision, token, game, outcome, config, pool);
       }
     }
   }
@@ -366,8 +451,10 @@ async function runSportsPipeline(pool: Pool, config: SportsConfig): Promise<void
 ### 5.1 New Environment Variables
 
 ```bash
-# The Odds API
-ODDS_API_KEY=your_key_here
+# Odds data source (choose one)
+ODDS_PROVIDER=sharpapi              # sharpapi | oddspapi | consensus
+SHARPAPI_KEY=your_key_here          # SharpAPI API key
+ODDSPAPI_KEY=your_key_here          # OddsPapi API key (alternative)
 
 # Sports strategy config
 SPORTS_ENABLED=true
@@ -444,22 +531,41 @@ Add parallel query functions for sports_bets that mirror the existing weather_be
 
 ---
 
-## 7. The Odds API Credit Budget
+## 7. Data Source Cost & Budget
 
-| Plan | Credits/mo | Price | Enough? |
-|------|-----------|-------|---------|
-| Free | 500 | $0 | Dev/testing only (5 days) |
-| 20K | 20,000 | $30/mo | Tight — 1 sport, h2h only, every 15 min |
-| **100K** | **100,000** | **$59/mo** | **Good for 3-4 sports, h2h, every 10 min** |
-| 5M | 5,000,000 | $119/mo | Overkill unless adding spreads/totals |
+### Phased API Strategy
 
-**Recommended: Start with $30/mo (20K plan) during paper trade, upgrade to $59/mo for live.**
+| Phase | Provider | Plan | Cost | Latency | What You Get |
+|-------|----------|------|------|---------|-------------|
+| **Validate** | SharpAPI | Free | $0/mo | <89ms SSE | 12 req/min, 2 sportsbooks. Prove edges exist via paper trade. |
+| **Go Live** | OddsPapi | Pro | $49/mo | ~1s WS | 348 bookmakers incl. Pinnacle + Polymarket in one API. WebSocket streaming. |
+| **Scale** | SharpAPI | Hobby | $79/mo | <89ms SSE | 20+ sportsbooks, fastest latency. Use own vig-removal code. TS SDK. |
+| **Premium** | SharpAPI | Pro | $229/mo | <89ms SSE | Pre-computed `ev_percent`, arb detection, middles alerts. Skip vig-removal. |
 
-Credit math for 20K plan:
-- 1 sport (NBA), h2h only, Pinnacle + Polymarket regions: 2 credits per call
-- Every 15 min during NBA game hours (6h/day): 24 calls/day = 48 credits/day
-- 30 days = 1,440 credits/month — well within 20K
-- Room to add 2-3 more sports
+### Why This Order
+
+1. **SharpAPI free** is the most generous free tier (17K req/day vs OddsPapi's 250 req/mo). Enough for weeks of paper trading.
+2. **OddsPapi Pro ($49/mo)** is the cheapest live option with both Pinnacle AND Polymarket — one API call gives you both sides of the comparison. At $500-1000 capital, the $49/mo cost leaves room for net profit (~$37/mo net at $1000 capital).
+3. **SharpAPI Hobby ($79/mo)** becomes worth it at $1,500+ capital when the 10x faster latency (89ms vs 1s) helps capture more edges before they close.
+4. **SharpAPI Pro ($229/mo)** only at $3,000+ capital when pre-computed EV saves development time and the extra features generate measurable additional profit.
+
+### Breakeven Analysis
+
+| API Cost | Min Capital to Break Even | Monthly EV Needed | Net Profit at $1000 |
+|----------|--------------------------|-------------------|---------------------|
+| $0 (free) | $0 | $0 | ~$86 |
+| $49/mo | ~$600 | $49 | ~$37 |
+| $79/mo | ~$1,000 | $79 | ~$7 |
+| $229/mo | ~$2,700 | $229 | -$143 (loss) |
+
+### Consensus Fallback
+
+If Pinnacle data disappears from all providers, the bot falls back to **consensus devigging**:
+- Fetch odds from 40+ bookmakers via OddsPapi or The Odds API
+- Shin-devig each bookmaker's odds independently
+- Take median fair probability across all books
+- Academic research confirms this approximates sharp lines within 1-2%
+- Sufficient for our 5%+ edge threshold on Polymarket
 
 ---
 
@@ -490,22 +596,32 @@ Start with moneyline only. It's simplest (2-way outcome, direct probability comp
 
 ## 10. Phased Rollout
 
-### Phase 2a: Paper Trade (2-3 weeks)
-- Build all modules
+### Phase 2a: Paper Trade (2-3 weeks) — SharpAPI Free ($0/mo)
+- Build all modules with SharpAPI free tier (12 req/min, 2 sportsbooks)
 - Run pipeline with `PHASE=2a` — simulated trades logged to DB
 - Measure: number of edges found, simulated hit rate, simulated P&L
 - **Exit criteria:** 50+ simulated bets, simulated win rate > 52%, positive simulated P&L
+- If SharpAPI free tier has insufficient sportsbook coverage, supplement with OddsPapi free (250 req/mo)
 
-### Phase 2b: Live with $200 ($30/mo API)
+### Phase 2b: Live with $200-$500 — OddsPapi Pro ($49/mo)
+- Switch to OddsPapi Pro for 348 bookmakers + Polymarket + WebSocket
 - Deploy with real money, $20 max per bet
 - Start with NBA moneyline only
 - **Exit criteria:** 30+ live bets, win rate > 50%, no single-day loss > 5% of capital
 
-### Phase 2c: Scale to $500-$1000 ($59/mo API)
+### Phase 2c: Scale to $1,000+ — SharpAPI Hobby ($79/mo)
+- Upgrade to SharpAPI Hobby for sub-89ms latency + TypeScript SDK
 - Increase max bet to $50
 - Add EPL and NHL
 - Add spread markets
 - Full risk manager rules
+- Fetch Polymarket prices via Gamma API / Grimoire (SharpAPI doesn't include Polymarket on Hobby)
+
+### Phase 2d: Premium at $3,000+ — SharpAPI Pro ($229/mo)
+- Pre-computed `ev_percent` eliminates vig-removal step
+- Built-in arbitrage detection and middles alerts
+- Increase max bet to $100
+- Consider adding more sports (NCAA, UFC, Champions League)
 
 ---
 
@@ -552,10 +668,14 @@ cron.schedule('*/30 * * * *', () => {
 - Sports bets within the same day may be correlated (e.g., slate of NBA favorites all losing)
 - Mitigation: max concurrent bets limit + daily loss limit
 
-### API Dependency
-- The Odds API is the single data source — if it goes down, bot cannot find edges
-- Pinnacle odds may have delay (scraped from public site, not direct feed)
-- Mitigation: graceful degradation (skip cycle, alert via Telegram)
+### API Dependency & Pinnacle Data Risk
+- Pinnacle shut down their public API in July 2025. All third-party providers source Pinnacle data via scraping, PS3838 white-label, or commercial intermediaries.
+- Any provider could lose Pinnacle access at any time.
+- **Mitigation (3 layers):**
+  1. Pluggable OddsClient adapter — swap providers without changing pipeline logic
+  2. Consensus fallback — median of 40+ devigged bookmakers approximates sharp lines
+  3. Graceful degradation — if all odds sources fail, skip cycle and alert via Telegram
+- The bot should track which bookmaker data is actually present in each response and alert if Pinnacle disappears.
 
 ---
 
@@ -572,10 +692,10 @@ cron.schedule('*/30 * * * *', () => {
 | EV per bet | $0.48 |
 | Bets per month | 45-90 |
 | **Monthly EV** | **$22-$43** |
-| Monthly API cost | $30 |
-| **Net monthly profit** | **-$8 to +$13** |
+| Monthly API cost | $49 (OddsPapi Pro) |
+| **Net monthly profit** | **-$27 to -$6** |
 
-At NBA-only + $500 capital + $30/mo API, breakeven is tight. The strategy becomes clearly profitable when:
+At NBA-only + $500 capital + $49/mo API, the bot is not profitable. The strategy becomes profitable when:
 - Adding EPL + NHL (doubles+ opportunity count)
 - Scaling capital to $1000 (doubles bet size)
 - Both together: ~$60-130 net monthly profit
@@ -591,8 +711,18 @@ At NBA-only + $500 capital + $30/mo API, breakeven is tight. The strategy become
 | EV per bet | $0.90 |
 | Bets per month | 90-150 |
 | **Monthly EV** | **$81-$135** |
-| Monthly API cost | $59 |
-| **Net monthly profit** | **$22-$76** |
+| Monthly API cost | $49 (OddsPapi Pro) |
+| **Net monthly profit** | **$32-$86** |
+
+### At Scale ($3000 capital, 3 sports, SharpAPI Pro)
+
+| Metric | Value |
+|--------|-------|
+| Average bet size | $40 |
+| Bets per month | 90-150 |
+| **Monthly EV** | **$243-$405** |
+| Monthly API cost | $229 (SharpAPI Pro) |
+| **Net monthly profit** | **$14-$176** |
 
 ---
 
@@ -679,26 +809,30 @@ This means a 5% raw edge becomes ~4.5% net edge.
 ## 18. Sports Config Type
 
 ```typescript
+type OddsProvider = 'sharpapi' | 'oddspapi' | 'consensus';
+
 interface SportsConfig {
   enabled: boolean;
-  oddsApiKey: string;
-  oddsApiBaseUrl: string;        // https://api.the-odds-api.com/v4
-  minEdge: number;               // 0.05 (5%)
-  kellyFraction: number;         // 0.15
-  maxBet: number;                // phase-dependent
-  maxConcurrent: number;         // 8 (shared with weather via cross-table query)
-  scanIntervalMinutes: number;   // 15
-  sports: Sport[];               // ['basketball_nba']
-  minVolume: number;             // 50000
-  estimatedFees: number;         // 0.005
-  preGameOnly: boolean;          // true (Phase 1)
+  oddsProvider: OddsProvider;     // which adapter to use
+  sharpApiKey: string;            // SharpAPI API key
+  oddsPapiKey: string;            // OddsPapi API key
+  minEdge: number;                // 0.05 (5%)
+  kellyFraction: number;          // 0.15
+  maxBet: number;                 // phase-dependent
+  maxConcurrent: number;          // 8 (shared with weather via cross-table query)
+  scanIntervalMinutes: number;    // 15
+  sports: Sport[];                // ['basketball_nba']
+  minVolume: number;              // 50000
+  estimatedFees: number;          // 0.005
+  preGameOnly: boolean;           // true (Phase 1)
 }
 
 function loadSportsConfig(): SportsConfig {
   return {
     enabled: process.env.SPORTS_ENABLED === 'true',
-    oddsApiKey: process.env.ODDS_API_KEY || '',
-    oddsApiBaseUrl: 'https://api.the-odds-api.com/v4',
+    oddsProvider: (process.env.ODDS_PROVIDER || 'sharpapi') as OddsProvider,
+    sharpApiKey: process.env.SHARPAPI_KEY || '',
+    oddsPapiKey: process.env.ODDSPAPI_KEY || '',
     minEdge: Number(process.env.SPORTS_MIN_EDGE || 0.05),
     kellyFraction: 0.15,
     maxBet: Number(process.env.SPORTS_MAX_BET || 20),
