@@ -3,8 +3,11 @@ import { CITIES } from '../../src/config/cities.js';
 import { loadConfig } from '../../src/config/index.js';
 
 describe('City Config', () => {
-  it('has exactly 3 cities', () => {
-    expect(Object.keys(CITIES)).toHaveLength(3);
+  it('has at least 3 cities (NYC, London, Seoul + expanded)', () => {
+    expect(Object.keys(CITIES).length).toBeGreaterThanOrEqual(3);
+    expect(CITIES.NYC).toBeDefined();
+    expect(CITIES.London).toBeDefined();
+    expect(CITIES.Seoul).toBeDefined();
   });
 
   it('has NYC with correct coords and timezone', () => {

@@ -1,6 +1,6 @@
 /** City configuration — static, from config */
 export interface CityConfig {
-  key: 'NYC' | 'London' | 'Seoul';
+  key: string;
   lat: number;
   lon: number;
   station: string;

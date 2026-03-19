@@ -4,6 +4,17 @@ const KNOWN_CITIES: Record<string, string> = {
   'nyc': 'NYC',
   'london': 'London',
   'seoul': 'Seoul',
+  'tokyo': 'Tokyo',
+  'shanghai': 'Shanghai',
+  'chicago': 'Chicago',
+  'atlanta': 'Atlanta',
+  'miami': 'Miami',
+  'warsaw': 'Warsaw',
+  'toronto': 'Toronto',
+  'paris': 'Paris',
+  'wellington': 'Wellington',
+  'tel aviv': 'Tel Aviv',
+  'hong kong': 'Hong Kong',
 };
 
 export interface ParsedMarket {

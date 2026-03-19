@@ -31,9 +31,20 @@ describe('MarketMatcher Parser', () => {
       expect(result!.bracketUpperC).toBeCloseTo(fahrenheitToCelsius(59), 1);
     });
 
-    it('returns null for unknown city (Shanghai)', () => {
+    it('parses Shanghai single-degree Celsius market', () => {
       const result = parseMarketTitle(
         'Will the highest temperature in Shanghai be 12°C on March 19?'
+      );
+      expect(result).not.toBeNull();
+      expect(result!.cityKey).toBe('Shanghai');
+      expect(result!.bracketLowerC).toBe(12);
+      expect(result!.bracketUpperC).toBe(13);
+      expect(result!.originalUnit).toBe('C');
+    });
+
+    it('returns null for unknown city (Bogota)', () => {
+      const result = parseMarketTitle(
+        'Will the highest temperature in Bogota be 22°C on March 19?'
       );
       expect(result).toBeNull();
     });
