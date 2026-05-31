@@ -1,6 +1,25 @@
-.env
-.idea
-scripts
+# Dependencies and build output
 node_modules/
 dist/
+coverage/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Runtime output
+logs/
 *.log
+
+# Local editor and OS files
+.DS_Store
+.idea/
+.vscode/
+
+# Agent/local workflow files
+.claude/
+CLAUDE.md
+docs/superpowers/
+docs/original/
+scripts/.venv/

@@ -10,7 +10,9 @@ const TEST_DB_CONFIG = {
   password: process.env.MYSQL_PASSWORD || 'test',
 };
 
-describe('DB Queries (integration)', () => {
+const describeIntegration = process.env.RUN_INTEGRATION_TESTS === '1' ? describe : describe.skip;
+
+describeIntegration('DB Queries (integration)', () => {
   let pool: ReturnType<typeof getPool>;
 
   beforeAll(async () => {
